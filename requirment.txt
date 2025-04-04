@@ -1,0 +1,9 @@
+numpy
+opencv-python
+tensorflow==2.13.0
+keras
+pandas
+scikit-learn
+matplotlib
+seaborn
+gtts

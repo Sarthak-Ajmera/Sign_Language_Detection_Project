@@ -1,0 +1,301 @@
+import cv2
+import numpy as np
+import mediapipe as mp
+from tensorflow.keras.models import load_model
+from gtts import gTTS
+import pygame
+import time
+import os
+from collections import deque
+
+# Constants
+MIN_CONFIDENCE = 0.85  # Minimum confidence threshold
+BUFFER_SIZE = 10       # Prediction buffer size
+ROI_PADDING = 30       # Padding around hand ROI
+MAX_RETRIES = 5        # Webcam initialization retries
+
+class SignLanguageDetector:
+    def __init__(self):
+        # Initialize pygame mixer
+        pygame.mixer.init()
+        
+        # Initialize variables
+        self.current_text = ""
+        self.prediction_buffer = deque(maxlen=BUFFER_SIZE)
+        self.last_roi = None
+        self.cap = None
+        self.model = None
+        self.hands = None
+        
+    def initialize_webcam(self):
+        """Initialize webcam with retries and error handling."""
+        for i in range(MAX_RETRIES):
+            self.cap = cv2.VideoCapture(0)
+            if self.cap.isOpened():
+                # Set optimal camera parameters
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                self.cap.set(cv2.CAP_PROP_FPS, 30)
+                print("✅ Webcam initialized successfully")
+                return True
+            print(f"⚠ Attempt {i+1}/{MAX_RETRIES}: Webcam not available, retrying...")
+            time.sleep(1)
+        print("❌ Error: Could not initialize webcam after multiple attempts")
+        return False
+
+    def load_model(self, model_path):
+        """Load the trained model with error handling and shape verification."""
+        try:
+            self.model = load_model(model_path)
+            print("✅ Model loaded successfully")
+            
+            # Verify input shape
+            expected_shape = self.model.layers[0].input_shape[1:]
+            print(f"ℹ Model expects input shape: {expected_shape}")
+            
+            return True
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            return False
+
+    def initialize_hand_detection(self):
+        """Initialize MediaPipe hand detection."""
+        mp_hands = mp.solutions.hands
+        self.hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7
+        )
+        print("✅ Hand detection initialized")
+
+    def extract_hand_roi(self, frame, landmarks):
+        """Extract tight ROI around hand with padding."""
+        h, w = frame.shape[:2]
+        x_coords = [lm.x * w for lm in landmarks.landmark]
+        y_coords = [lm.y * h for lm in landmarks.landmark]
+        
+        min_x, max_x = int(min(x_coords)), int(max(x_coords))
+        min_y, max_y = int(min(y_coords)), int(max(y_coords))
+        
+        # Add padding and ensure within frame bounds
+        min_x = max(0, min_x - ROI_PADDING)
+        max_x = min(w, max_x + ROI_PADDING)
+        min_y = max(0, min_y - ROI_PADDING)
+        max_y = min(h, max_y + ROI_PADDING)
+        
+        roi = frame[min_y:max_y, min_x:max_x]
+        return roi, (min_x, min_y, max_x - min_x, max_y - min_y)
+
+    def preprocess_roi(self, roi):
+        """Enhanced preprocessing that ensures 3-channel output."""
+        if roi.size == 0:
+            return None
+            
+        # Convert to grayscale
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        # Apply adaptive thresholding
+        thresh = cv2.adaptiveThreshold(gray, 255, 
+                                     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY_INV, 11, 2)
+        
+        # Resize with anti-aliasing
+        resized = cv2.resize(thresh, (64, 64), interpolation=cv2.INTER_AREA)
+        
+        # Convert to 3 channels by stacking
+        processed = resized / 255.0
+        processed = np.stack((processed,)*3, axis=-1)  # Duplicate to 3 channels
+        processed = np.expand_dims(processed, axis=0)  # Add batch dimension
+        
+        return processed
+
+    def predict_gesture(self, frame):
+        """Predict gesture with stabilization and confidence checking."""
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb_frame = cv2.flip(rgb_frame, 1)
+        results = self.hands.process(rgb_frame)
+        
+        prediction_info = {
+            'label': None,
+            'confidence': 0,
+            'roi_rect': None,
+            'roi_img': None
+        }
+        
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                # Draw landmarks
+                mp.solutions.drawing_utils.draw_landmarks(
+                    frame, hand_landmarks, mp.solutions.hands.HAND_CONNECTIONS)
+                
+                # Extract and process ROI
+                roi, rect = self.extract_hand_roi(frame, hand_landmarks)
+                if roi.size == 0:
+                    continue
+                    
+                processed_img = self.preprocess_roi(roi)
+                if processed_img is None:
+                    continue
+                    
+                # Make prediction
+                try:
+                    prediction = self.model.predict(processed_img)
+                    predicted_class = np.argmax(prediction, axis=1)[0]
+                    predicted_label = chr(ord('A') + predicted_class)
+                    confidence = np.max(prediction)
+                    
+                    # Store ROI for debugging
+                    self.last_roi = roi.copy()
+                    
+                    # Update prediction info
+                    prediction_info.update({
+                        'label': predicted_label,
+                        'confidence': confidence,
+                        'roi_rect': rect,
+                        'roi_img': roi
+                    })
+                    
+                    # Only accept high-confidence predictions
+                    if confidence > MIN_CONFIDENCE:
+                        self.prediction_buffer.append(predicted_label)
+                        
+                except Exception as e:
+                    print(f"⚠ Prediction error: {e}")
+                    continue
+                    
+            # Return stabilized prediction if available
+            if self.prediction_buffer:
+                prediction_info['label'] = max(set(self.prediction_buffer), 
+                                            key=self.prediction_buffer.count)
+                
+        return prediction_info
+
+    def text_to_speech(self, text):
+        """Convert text to speech with error handling."""
+        if not text.strip():
+            return
+            
+        try:
+            print(f"🗣 Speaking: '{text}'")
+            tts = gTTS(text=text, lang='en')
+            tts.save("output.mp3")
+            
+            pygame.mixer.music.load("output.mp3")
+            pygame.mixer.music.play()
+            
+            # Wait for playback to finish
+            while pygame.mixer.music.get_busy():
+                pygame.time.Clock().tick(10)
+                
+        except Exception as e:
+            print(f"❌ Error in text-to-speech: {e}")
+
+    def display_info(self, frame, prediction_info):
+        """Display information on frame."""
+        # Draw ROI rectangle if available
+        if prediction_info['roi_rect']:
+            x, y, w, h = prediction_info['roi_rect']
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            
+            if prediction_info['label']:
+                conf_text = f"{prediction_info['label']} ({prediction_info['confidence']:.2f})"
+                cv2.putText(frame, conf_text, (x, y-10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        
+        # Display instructions
+        instructions = [
+            "Press 'p' to add letter",
+            "Press SPACE to add space",
+            "Press 's' to speak sentence",
+            "Press 'd' to delete | 'c' to clear",
+            "Press 'q' to quit",
+            "Press 'r' to show ROI"
+        ]
+        
+        for i, text in enumerate(instructions):
+            cv2.putText(frame, text, (10, 30 + i*30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        # Display current text
+        cv2.putText(frame, f"Text: {self.current_text}", (10, 210), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+    def run(self):
+        """Main execution loop."""
+        if not self.initialize_webcam():
+            return
+            
+        if not self.load_model("C:\\sign_language_project\\models\\saved_models\\best_model.h5"):  # Update path as needed
+            return
+            
+        self.initialize_hand_detection()
+        
+        try:
+            while True:
+                ret, frame = self.cap.read()
+                if not ret:
+                    print("⚠ Frame capture error, retrying...")
+                    time.sleep(0.1)
+                    continue
+
+                # Get prediction
+                prediction_info = self.predict_gesture(frame)
+                
+                # Display info
+                self.display_info(frame, prediction_info)
+                
+                # Key handling
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('p'):
+                    if (prediction_info['label'] and 
+                        prediction_info['confidence'] > MIN_CONFIDENCE):
+                        self.current_text += prediction_info['label']
+                        print(f"✅ Added: {prediction_info['label']} | Current text: {self.current_text}")
+                
+                elif key == 32:  # Spacebar
+                    self.current_text += " "
+                    print(f"␣ Added space | Current text: {self.current_text}")
+                
+                elif key == ord('d') and self.current_text:
+                    self.current_text = self.current_text[:-1]
+                    print(f"🔙 Deleted last character | Current text: {self.current_text}")
+                
+                elif key == ord('c'):
+                    self.current_text = ""
+                    self.prediction_buffer.clear()
+                    print("🧹 Cleared all text.")
+                
+                elif key == ord('s') and self.current_text:
+                    self.text_to_speech(self.current_text)
+                
+                elif key == ord('r') and self.last_roi is not None:
+                    cv2.imshow("ROI Debug", self.last_roi)
+                
+                elif key == ord('q'):
+                    break
+                
+                cv2.imshow("Sign Language Detection", frame)
+
+        except Exception as e:
+            print(f"❌ Runtime error: {e}")
+        finally:
+            self.cleanup()
+
+    def cleanup(self):
+        """Release resources and clean up."""
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+        cv2.destroyAllWindows()
+        pygame.mixer.quit()
+        try:
+            os.remove("output.mp3")
+        except:
+            pass
+        print("✅ Resources released")
+
+if __name__ == "__main__":
+    print("🚀 Starting Sign Language Detection System...")
+    detector = SignLanguageDetector()
+    detector.run()
+
