@@ -1,10 +1,5 @@
 
 # Sign_Language_Detection_Project
-=======
-
-=======
-# Sign Language to Text/Speech Conversion
-
 A real-time system that converts American Sign Language (ASL) hand gestures into text and speech using deep learning. Built with Python, OpenCV, and TensorFlow.
 
 ## Features
