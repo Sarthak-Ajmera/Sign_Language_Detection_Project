@@ -45,6 +45,15 @@ BATCH_SIZE = 16
 PPO_CLIP = 0.2
 VALUE_COEF = 0.5
 ENTROPY_COEF = 0.01
+EPSILON = 1e-8
+
+MIN_EXPLANATION_LENGTH = 8
+MAX_EXPLANATION_LENGTH = 60
+
+CLASSIFICATION_REWARD_WEIGHT = 0.7
+CALIBRATION_REWARD_WEIGHT = 0.2
+EXPLANATION_REWARD_WEIGHT = 0.1
+EXPLANATION_TERMINAL_PUNCTUATION = (".", "!", "?")
 
 
 def set_seed(seed: int = 42):
@@ -209,7 +218,7 @@ def collate_fn(batch):
 
 
 def entropy_binary(p1: float) -> float:
-    p1 = max(1e-8, min(1 - 1e-8, p1))
+    p1 = max(EPSILON, min(1 - EPSILON, p1))
     p0 = 1.0 - p1
     return -(p0 * math.log(p0) + p1 * math.log(p1))
 
@@ -236,9 +245,16 @@ def explanation_reward(expl: str, top_feats: list) -> float:
             coverage += 1.0
     coverage /= max(1, len(top_feats))
     length = len(tokens)
-    length_reward = 1.0 if 8 <= length <= 60 else 0.2
-    naturalness = 1.0 if any(text.endswith(p) for p in [".", "!", "?"]) else 0.4
+    length_reward = 1.0 if MIN_EXPLANATION_LENGTH <= length <= MAX_EXPLANATION_LENGTH else 0.2
+    naturalness = 1.0 if any(text.endswith(p) for p in EXPLANATION_TERMINAL_PUNCTUATION) else 0.4
     return 0.6 * coverage + 0.3 * length_reward + 0.1 * naturalness
+
+
+def select_actions(action_logits: torch.Tensor, greedy: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    dist = torch.distributions.Categorical(logits=action_logits)
+    actions = torch.argmax(action_logits, dim=1) if greedy else dist.sample()
+    logp = dist.log_prob(actions)
+    return actions, logp
 
 
 class PPOPolicy(nn.Module):
@@ -285,9 +301,7 @@ def collect_batch(policy, hybrid_model, loader, device):
             base_probs = torch.softmax(logits, dim=1)
             states = build_state_features(base_probs, inputs["features"])
             action_logits, values = policy(states)
-            dist = torch.distributions.Categorical(logits=action_logits)
-            actions = dist.sample()
-            logp = dist.log_prob(actions)
+            actions, logp = select_actions(action_logits, greedy=False)
 
         pred_cls = (actions // MAX_EXPLS).long()
         expl_idx = (actions % MAX_EXPLS).long()
@@ -300,10 +314,14 @@ def collect_batch(policy, hybrid_model, loader, device):
             if y == 1 and pred == y:
                 cls_reward += 0.5
             p_true = float(base_probs[i, y].item())
-            calib_reward = 2.0 * p_true - 1.0
+            calib_reward = math.log(p_true + EPSILON)
             chosen_expl = batch["explanations"][i][int(expl_idx[i].item())]
             er = explanation_reward(chosen_expl, batch["top_features"][i])
-            total_r = 0.7 * cls_reward + 0.2 * calib_reward + 0.1 * er
+            total_r = (
+                CLASSIFICATION_REWARD_WEIGHT * cls_reward
+                + CALIBRATION_REWARD_WEIGHT * calib_reward
+                + EXPLANATION_REWARD_WEIGHT * er
+            )
             rewards.append(total_r)
 
         rewards = torch.tensor(rewards, device=device, dtype=torch.float32)
@@ -363,7 +381,7 @@ def evaluate(policy, hybrid_model, ds, batch_size=16):
         states = build_state_features(base_probs, inputs["features"])
         action_logits, _ = policy(states)
         act_probs = torch.softmax(action_logits, dim=1)
-        actions = act_probs.argmax(dim=1)
+        actions, _ = select_actions(action_logits, greedy=True)
         pred_cls = (actions // MAX_EXPLS).long()
         expl_idx = (actions % MAX_EXPLS).long()
 
@@ -387,11 +405,16 @@ def evaluate(policy, hybrid_model, ds, batch_size=16):
 
 def save_roc(y_true, y_prob, auc_score, path):
     fpr, tpr, thresholds = roc_curve(y_true, y_prob)
-    best_idx = np.argmax(tpr - fpr)
+    youden_index_threshold_idx = np.argmax(tpr - fpr)
     plt.figure(figsize=(8, 6))
     plt.plot(fpr, tpr, lw=2, color="steelblue", label=f"ROC (AUC={auc_score:.4f})")
     plt.plot([0, 1], [0, 1], "--", color="gray", lw=1)
-    plt.scatter(fpr[best_idx], tpr[best_idx], color="crimson", label=f"Optimal threshold={thresholds[best_idx]:.3f}")
+    plt.scatter(
+        fpr[youden_index_threshold_idx],
+        tpr[youden_index_threshold_idx],
+        color="crimson",
+        label=f"Youden threshold={thresholds[youden_index_threshold_idx]:.3f}",
+    )
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate")
     plt.title("ROC Curve — RL Refined Hybrid SHAP Classifier")
